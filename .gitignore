@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Large data / cache
+data/
+dataset/
+datasets/
+004.수어영상/
+outputs/
+cache/
+*_cache*/
+*.npy
+*.npz
+*.zip
+*.tar
+*.tar.gz
+*.part*
+*.avi
+*.mp4
+
+# AIHub keypoint/morpheme bulk files
+*_keypoints.json
+*_morpheme.json
+
+# Model weights: upload these to GitHub Releases, not normal Git
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# Logs
+*.log

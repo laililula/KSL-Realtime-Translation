@@ -1,0 +1,16 @@
+py -3 .\realtime_ksl_keypoint_infer.py `
+  --model_path ".\models\ksl_keypoint_tcn_final.pt" `
+  --camera 0 `
+  --window_frames 96 `
+  --multi_windows 48,72,96 `
+  --min_window_frames 32 `
+  --predict_every 3 `
+  --topk 5 `
+  --conf_threshold 0.70 `
+  --majority_ratio 0.65 `
+  --smooth_history 8 `
+  --min_commit_history 5 `
+  --cooldown_sec 1.0 `
+  --repeat_cooldown_sec 2.0 `
+  --max_missing_ratio 0.55 `
+  --hold_missing_hands 6
