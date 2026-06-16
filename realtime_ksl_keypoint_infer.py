@@ -18,13 +18,18 @@ import math
 import time
 from collections import Counter, deque
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except Exception:
+    Image = ImageDraw = ImageFont = None
 
 try:
     import mediapipe as mp
@@ -404,8 +409,110 @@ def should_commit(pred_history: deque, conf_threshold: float, majority_ratio: fl
     return None
 
 
+def load_label_map(path: str) -> Dict[str, str]:
+    """Load WORDxxxx -> Korean/gloss mapping from a JSON file.
+
+    Supported formats:
+      1) {"WORD1501": "고민", ...}
+      2) {"WORD1501": {"name": "고민"}, ...}
+    """
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        print(f"[WARN] label map not found: {p}")
+        return {}
+    with p.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    out = {}
+    for k, v in data.items():
+        key = str(k).strip()
+        if isinstance(v, dict):
+            name = v.get("name") or v.get("gloss") or v.get("display") or v.get("word") or v.get("label")
+        else:
+            name = v
+        if name is not None and str(name).strip():
+            out[key] = str(name).strip()
+    return out
+
+
+def format_label(label: str, label_map: Dict[str, str], show_word_id: bool = True) -> str:
+    word = label_map.get(label)
+    if not word:
+        return label
+    return f"{label} | {word}" if show_word_id else word
+
+
+_FONT_CACHE = {}
+
+def _has_non_ascii(text: str) -> bool:
+    return any(ord(ch) > 127 for ch in str(text))
+
+
+def _get_korean_font(size: int):
+    if ImageFont is None:
+        return None
+    key = int(size)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    candidates = [
+        "C:/Windows/Fonts/malgun.ttf",
+        "C:/Windows/Fonts/malgunbd.ttf",
+        "C:/Windows/Fonts/gulim.ttc",
+        "C:/Windows/Fonts/batang.ttc",
+    ]
+    font = None
+    for fp in candidates:
+        try:
+            if Path(fp).exists():
+                font = ImageFont.truetype(fp, key)
+                break
+        except Exception:
+            pass
+    if font is None:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+    _FONT_CACHE[key] = font
+    return font
+
+
 def put_text(img, text, org, scale=0.8, color=(0, 255, 0), thickness=2):
-    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+    """Draw text on a BGR OpenCV image. Uses PIL for Korean text.
+
+    cv2.putText cannot render Korean properly, so non-ASCII text is drawn with
+    the Windows Malgun Gothic font when available.
+    """
+    text = str(text)
+    if not _has_non_ascii(text) or Image is None or ImageDraw is None:
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+        return
+
+    font_size = max(12, int(scale * 30))
+    font = _get_korean_font(font_size)
+    if font is None:
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+        return
+
+    # OpenCV uses BGR, PIL uses RGB.
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil_img)
+    x, y = org
+    # cv2 org is baseline-ish; PIL org is top-left. Adjust a little upward.
+    y = max(0, y - font_size)
+    rgb_color = (int(color[2]), int(color[1]), int(color[0]))
+
+    # Simple thickness effect by drawing around the target point.
+    if thickness > 1:
+        for dx in range(-thickness + 1, thickness):
+            for dy in range(-thickness + 1, thickness):
+                if dx == 0 and dy == 0:
+                    continue
+                draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0))
+    draw.text((x, y), text, font=font, fill=rgb_color)
+    img[:] = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
 
 
 # -----------------------------------------------------------------------------
@@ -415,6 +522,8 @@ def put_text(img, text, org, scale=0.8, color=(0, 255, 0), thickness=2):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_path", type=str, required=True)
+    ap.add_argument("--label_map_path", type=str, default="", help="Optional JSON mapping WORDxxxx -> Korean/gloss")
+    ap.add_argument("--hide_word_id", action="store_true", help="Show only mapped Korean/gloss text, not WORD id")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -439,11 +548,14 @@ def main():
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     model, labels, meta, target_len = load_model(Path(args.model_path), device)
+    label_map = load_label_map(args.label_map_path)
+    show_word_id = not args.hide_word_id
     window_sizes = parse_window_sizes(args.multi_windows, args.window_frames)
 
     print("[INFO] model loaded:", args.model_path)
     print("[INFO] device:", device)
     print("[INFO] classes:", len(labels))
+    print("[INFO] label_map entries:", len(label_map))
     print("[INFO] target_len:", target_len)
     print("[INFO] model:", meta.get("model", {}))
     print("[INFO] multi_windows:", window_sizes)
@@ -536,15 +648,16 @@ def main():
                         if commit is not None:
                             c_idx, c_prob, c_ratio = commit
                             label = labels[c_idx]
+                            display_label = format_label(label, label_map, show_word_id)
                             elapsed = now - last_commit_time
                             is_repeat = (last_commit_label == label)
                             required_cooldown = args.repeat_cooldown_sec if is_repeat else args.cooldown_sec
                             if elapsed >= required_cooldown:
-                                committed_words.append(label)
+                                committed_words.append(display_label)
                                 last_commit_label = label
                                 last_commit_time = now
                                 pred_history.clear()
-                                last_status = f"COMMIT {label} p={c_prob:.2f} r={c_ratio:.2f}"
+                                last_status = f"COMMIT {display_label} p={c_prob:.2f} r={c_ratio:.2f}"
                     except Exception as e:
                         last_status = f"predict error: {e}"
 
@@ -553,8 +666,9 @@ def main():
 
             y0 = 100
             for rank, (idx, prob) in enumerate(last_topk[:args.topk], start=1):
-                label = labels[idx] if 0 <= idx < len(labels) else str(idx)
-                put_text(display, f"{rank}. {label}: {prob:.3f}", (20, y0 + 30 * (rank - 1)), 0.75, (0, 255, 0), 2)
+                raw_label = labels[idx] if 0 <= idx < len(labels) else str(idx)
+                label = format_label(raw_label, label_map, show_word_id)
+                put_text(display, f"{rank}. {label}: {prob:.3f}", (20, y0 + 34 * (rank - 1)), 0.75, (0, 255, 0), 2)
 
             sent = " ".join(committed_words[-8:])
             put_text(display, f"Committed: {sent}", (20, display.shape[0] - 35), 0.75, (255, 255, 0), 2)

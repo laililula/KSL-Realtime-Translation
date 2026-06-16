@@ -1,5 +1,6 @@
-py -3 .\realtime_ksl_keypoint_infer.py `
+python .\realtime_ksl_keypoint_infer.py `
   --model_path ".\models\ksl_keypoint_tcn_final.pt" `
+  --label_map_path ".\models\label_map.json" `
   --camera 0 `
   --window_frames 96 `
   --multi_windows 48,72,96 `
