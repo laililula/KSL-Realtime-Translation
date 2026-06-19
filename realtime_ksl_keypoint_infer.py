@@ -409,6 +409,86 @@ def should_commit(pred_history: deque, conf_threshold: float, majority_ratio: fl
     return None
 
 
+def stable_candidates_from_topk_history(
+    topk_history: deque,
+    stable_topk: int = 5,
+    rank_decay: float = 0.65,
+) -> List[Tuple[int, float, float, float]]:
+    """Accumulate evidence from recent Top-K predictions.
+
+    Returns:
+        [(class_idx, score, count_ratio, last_seen_prob), ...]
+
+    Why this is better than only storing Top-1:
+      - If the correct word repeatedly appears as rank 2~5, it still gets score.
+      - Recent predictions get slightly larger age weights.
+      - Lower ranks get lower score via rank_decay.
+    """
+    if not topk_history:
+        return []
+
+    hist = list(topk_history)
+    n = len(hist)
+    scores: Dict[int, float] = {}
+    counts: Counter = Counter()
+    last_seen_prob: Dict[int, float] = {}
+    total_age_weight = 0.0
+
+    stable_topk = max(1, int(stable_topk))
+    rank_decay = float(rank_decay)
+
+    for age, preds in enumerate(hist):
+        # Older predictions still count, but recent predictions count more.
+        age_weight = 0.60 + 0.40 * ((age + 1) / max(1, n))
+        total_age_weight += age_weight
+
+        for rank, (idx, prob) in enumerate(preds[:stable_topk]):
+            rank_weight = rank_decay ** rank
+            contribution = float(prob) * rank_weight * age_weight
+            scores[idx] = scores.get(idx, 0.0) + contribution
+            counts[idx] += 1
+            last_seen_prob[idx] = float(prob)
+
+    denom = max(1e-8, total_age_weight)
+    out = []
+    for idx, score in scores.items():
+        out.append((idx, score / denom, counts[idx] / max(1, n), last_seen_prob.get(idx, 0.0)))
+
+    out.sort(key=lambda x: (x[1], x[2], x[3]), reverse=True)
+    return out
+
+
+def choose_stable_commit(
+    candidates: List[Tuple[int, float, float, float]],
+    min_score: float,
+    min_count_ratio: float,
+    min_margin: float,
+    min_last_prob: float = 0.0,
+):
+    """Choose a commit candidate from accumulated Top-K evidence.
+
+    candidates item format: (class_idx, stable_score, count_ratio, last_seen_prob).
+
+    The first three thresholds check accumulated evidence across recent windows.
+    min_last_prob additionally prevents committing a candidate whose latest
+    smoothed probability is still too weak, even if it was stable for a while.
+    """
+    if not candidates:
+        return None
+    best = candidates[0]
+    second_score = candidates[1][1] if len(candidates) > 1 else 0.0
+    margin = best[1] - second_score
+    last_prob = best[3]
+    if (
+        best[1] >= min_score
+        and best[2] >= min_count_ratio
+        and margin >= min_margin
+        and last_prob >= min_last_prob
+    ):
+        return best[0], best[1], best[2], margin, last_prob
+    return None
+
+
 def load_label_map(path: str) -> Dict[str, str]:
     """Load WORDxxxx -> Korean/gloss mapping from a JSON file.
 
@@ -540,7 +620,26 @@ def main():
     ap.add_argument("--repeat_cooldown_sec", type=float, default=1.8)
     ap.add_argument("--max_missing_ratio", type=float, default=0.55)
     ap.add_argument("--hold_missing_hands", type=int, default=6)
+    ap.add_argument("--no_reset_after_commit", action="store_true",
+                    help="Do not clear sequence/probability buffers after a word is committed. Default clears them to prevent stale-window commits.")
+    ap.add_argument("--reset_hand_state_after_commit", action="store_true",
+                    help="Also clear cached previous hand landmarks after commit. Useful when stale hand-hold causes repeated predictions.")
     ap.add_argument("--min_motion_energy", type=float, default=0.0, help="0 disables idle filtering")
+    ap.add_argument("--prob_ema_alpha", type=float, default=0.55, help="EMA smoothing for full probability vector. 0 disables.")
+    ap.add_argument("--stable_history", type=int, default=24, help="Number of recent prediction steps used for Top-K evidence accumulation.")
+    ap.add_argument("--stable_topk", type=int, default=5, help="How many ranks from each prediction are accumulated.")
+    ap.add_argument("--rank_decay", type=float, default=0.65, help="Weight decay for lower ranks in Top-K accumulation.")
+    ap.add_argument("--stable_min_score", type=float, default=0.025, help="Minimum accumulated score required for commit.")
+    ap.add_argument("--stable_min_count_ratio", type=float, default=0.30, help="Minimum ratio of recent predictions where candidate appeared in Top-K.")
+    ap.add_argument("--stable_margin", type=float, default=0.005, help="Minimum score margin over second candidate for commit.")
+    ap.add_argument("--commit_min_last_prob", type=float, default=0.0,
+                    help="Minimum latest smoothed probability of the stable candidate required for commit. Useful to block low-confidence Top-1 commits.")
+    ap.add_argument("--commit_require_current_top1", action="store_true",
+                    help="Only commit when the stable candidate is also the current smoothed Top-1.")
+    ap.add_argument("--commit_min_current_top1_prob", type=float, default=0.0,
+                    help="Minimum probability of the current smoothed Top-1 required for commit.")
+    ap.add_argument("--show_raw_topk", action="store_true", help="Also show raw/EMA Top-K below stable candidates.")
+    ap.add_argument("--no_stable_commit", action="store_true", help="Use old Top-1 majority commit instead of stable Top-K evidence commit.")
     ap.add_argument("--no_mirror_display", action="store_true")
     ap.add_argument("--draw_landmarks", action="store_true")
     ap.add_argument("--device", type=str, default="")
@@ -559,6 +658,19 @@ def main():
     print("[INFO] target_len:", target_len)
     print("[INFO] model:", meta.get("model", {}))
     print("[INFO] multi_windows:", window_sizes)
+    print("[INFO] stable_topk:", {
+        "prob_ema_alpha": args.prob_ema_alpha,
+        "stable_history": args.stable_history,
+        "stable_topk": args.stable_topk,
+        "rank_decay": args.rank_decay,
+        "stable_min_score": args.stable_min_score,
+        "stable_min_count_ratio": args.stable_min_count_ratio,
+        "stable_margin": args.stable_margin,
+        "commit_min_last_prob": args.commit_min_last_prob,
+        "commit_require_current_top1": args.commit_require_current_top1,
+        "commit_min_current_top1_prob": args.commit_min_current_top1_prob,
+        "stable_commit": not args.no_stable_commit,
+    })
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -574,12 +686,15 @@ def main():
     mp_drawing = mp.solutions.drawing_utils
 
     seq_buffer = deque(maxlen=args.window_frames)
-    pred_history = deque(maxlen=args.smooth_history)
+    pred_history = deque(maxlen=args.smooth_history)  # old Top-1 history, kept as fallback
+    topk_history = deque(maxlen=args.stable_history)  # new Top-K evidence history
     committed_words = []
     last_commit_label = None
     last_commit_time = 0.0
     frame_count = 0
-    last_topk = []
+    last_topk = []          # raw/EMA Top-K
+    last_stable_topk = []   # accumulated stable Top-K: (idx, score, count_ratio, last_prob)
+    ema_probs = None
     last_status = "warming up"
     hand_state = {"last_lh": None, "last_rh": None, "lh_hold": 0, "rh_hold": 0}
 
@@ -638,26 +753,122 @@ def main():
                 else:
                     try:
                         probs = predict_probs_for_windows(model, seq_buffer, target_len, window_sizes, device)
-                        vals, inds = torch.topk(probs, k=min(args.topk, probs.numel()))
+
+                        # 1) Smooth the full probability vector, not just Top-1.
+                        if args.prob_ema_alpha > 0:
+                            a = float(args.prob_ema_alpha)
+                            if ema_probs is None:
+                                ema_probs = probs
+                            else:
+                                ema_probs = a * probs + (1.0 - a) * ema_probs
+                            probs_for_rank = ema_probs
+                        else:
+                            probs_for_rank = probs
+
+                        # 2) Get Top-K from the smoothed probability vector.
+                        k_for_history = min(max(args.topk, args.stable_topk), probs_for_rank.numel())
+                        vals, inds = torch.topk(probs_for_rank, k=k_for_history)
                         last_topk = [(int(i.item()), float(v.item())) for i, v in zip(inds, vals)]
+
                         best_idx, best_prob = last_topk[0]
                         pred_history.append((best_idx, best_prob))
-                        last_status = f"predicting energy={energy:.5f}"
+                        topk_history.append(last_topk)
 
-                        commit = should_commit(pred_history, args.conf_threshold, args.majority_ratio, args.min_commit_history)
-                        if commit is not None:
-                            c_idx, c_prob, c_ratio = commit
-                            label = labels[c_idx]
-                            display_label = format_label(label, label_map, show_word_id)
-                            elapsed = now - last_commit_time
-                            is_repeat = (last_commit_label == label)
-                            required_cooldown = args.repeat_cooldown_sec if is_repeat else args.cooldown_sec
-                            if elapsed >= required_cooldown:
-                                committed_words.append(display_label)
-                                last_commit_label = label
-                                last_commit_time = now
-                                pred_history.clear()
-                                last_status = f"COMMIT {display_label} p={c_prob:.2f} r={c_ratio:.2f}"
+                        # 3) Accumulate evidence from recent Top-K lists.
+                        last_stable_topk = stable_candidates_from_topk_history(
+                            topk_history,
+                            stable_topk=args.stable_topk,
+                            rank_decay=args.rank_decay,
+                        )
+
+                        if last_stable_topk:
+                            s_idx, s_score, s_ratio, s_last_prob = last_stable_topk[0]
+                            s_label = labels[s_idx] if 0 <= s_idx < len(labels) else str(s_idx)
+                            s_label = format_label(s_label, label_map, show_word_id)
+                            last_status = (
+                                f"stable {s_label} score={s_score:.3f} "
+                                f"seen={s_ratio:.2f} lastp={s_last_prob:.3f} energy={energy:.5f}"
+                            )
+                        else:
+                            last_status = f"predicting energy={energy:.5f}"
+
+                        # 4) Commit. Default is stable Top-K evidence commit.
+                        if args.no_stable_commit:
+                            old_commit = should_commit(
+                                pred_history,
+                                args.conf_threshold,
+                                args.majority_ratio,
+                                args.min_commit_history,
+                            )
+                            commit = None
+                            if old_commit is not None:
+                                c_idx, c_prob, c_ratio = old_commit
+                                commit = (c_idx, c_prob, c_ratio, 0.0)
+                        else:
+                            commit = choose_stable_commit(
+                                last_stable_topk,
+                                min_score=args.stable_min_score,
+                                min_count_ratio=args.stable_min_count_ratio,
+                                min_margin=args.stable_margin,
+                                min_last_prob=args.commit_min_last_prob,
+                            )
+
+                        if commit is not None and len(topk_history) >= args.min_commit_history:
+                            # Stable commit returns 5 values. Old Top-1 fallback returns 4 values.
+                            if len(commit) == 5:
+                                c_idx, c_score, c_ratio, c_margin, c_last_prob = commit
+                            else:
+                                c_idx, c_score, c_ratio, c_margin = commit
+                                c_last_prob = c_score
+
+                            current_top1_idx = last_topk[0][0] if last_topk else None
+                            current_top1_prob = last_topk[0][1] if last_topk else 0.0
+
+                            commit_block_reason = None
+                            if args.commit_require_current_top1 and c_idx != current_top1_idx:
+                                commit_block_reason = "stable candidate is not current top1"
+                            elif current_top1_prob < args.commit_min_current_top1_prob:
+                                commit_block_reason = f"current top1 prob low {current_top1_prob:.3f}"
+
+                            if commit_block_reason is not None:
+                                raw_label = labels[c_idx] if 0 <= c_idx < len(labels) else str(c_idx)
+                                display_label = format_label(raw_label, label_map, show_word_id)
+                                last_status = (
+                                    f"commit blocked {display_label}: {commit_block_reason} "
+                                    f"score={c_score:.3f} seen={c_ratio:.2f} lastp={c_last_prob:.3f}"
+                                )
+                            else:
+                                label = labels[c_idx]
+                                display_label = format_label(label, label_map, show_word_id)
+                                elapsed = now - last_commit_time
+                                is_repeat = (last_commit_label == label)
+                                required_cooldown = args.repeat_cooldown_sec if is_repeat else args.cooldown_sec
+                                if elapsed >= required_cooldown:
+                                    committed_words.append(display_label)
+                                    last_commit_label = label
+                                    last_commit_time = now
+
+                                    # IMPORTANT:
+                                    # After a commit, the sliding window still contains the just-finished sign.
+                                    # If we keep seq_buffer / stable scores alive, the same high-score evidence
+                                    # can remain during the following idle frames and cause another false commit.
+                                    # So by default, clear all inference evidence but keep committed_words.
+                                    pred_history.clear()
+                                    topk_history.clear()
+                                    ema_probs = None
+                                    last_topk = []
+                                    last_stable_topk = []
+                                    if not args.no_reset_after_commit:
+                                        seq_buffer.clear()
+                                        if args.reset_hand_state_after_commit:
+                                            hand_state = {"last_lh": None, "last_rh": None, "lh_hold": 0, "rh_hold": 0}
+
+                                    last_status = (
+                                        f"COMMIT {display_label} "
+                                        f"score={c_score:.3f} seen={c_ratio:.2f} margin={c_margin:.3f} "
+                                        f"lastp={c_last_prob:.3f} top1p={current_top1_prob:.3f} "
+                                        f"| reset={'off' if args.no_reset_after_commit else 'on'}"
+                                    )
                     except Exception as e:
                         last_status = f"predict error: {e}"
 
@@ -665,10 +876,29 @@ def main():
             put_text(display, f"Status: {last_status}", (20, 62), 0.7, (0, 255, 255), 2)
 
             y0 = 100
-            for rank, (idx, prob) in enumerate(last_topk[:args.topk], start=1):
+            put_text(display, "Stable candidates:", (20, y0), 0.72, (0, 255, 255), 2)
+            y0 += 32
+            for rank, item in enumerate(last_stable_topk[:args.topk], start=1):
+                idx, score, count_ratio, last_prob = item
                 raw_label = labels[idx] if 0 <= idx < len(labels) else str(idx)
                 label = format_label(raw_label, label_map, show_word_id)
-                put_text(display, f"{rank}. {label}: {prob:.3f}", (20, y0 + 34 * (rank - 1)), 0.75, (0, 255, 0), 2)
+                put_text(
+                    display,
+                    f"{rank}. {label}: score={score:.3f} seen={count_ratio:.2f} p={last_prob:.3f}",
+                    (20, y0 + 34 * (rank - 1)),
+                    0.68,
+                    (0, 255, 0),
+                    2,
+                )
+
+            if args.show_raw_topk:
+                y_raw = y0 + 34 * (args.topk + 1)
+                put_text(display, "Raw/EMA Top-K:", (20, y_raw), 0.68, (255, 255, 255), 2)
+                y_raw += 30
+                for rank, (idx, prob) in enumerate(last_topk[:args.topk], start=1):
+                    raw_label = labels[idx] if 0 <= idx < len(labels) else str(idx)
+                    label = format_label(raw_label, label_map, show_word_id)
+                    put_text(display, f"{rank}. {label}: {prob:.3f}", (20, y_raw + 28 * (rank - 1)), 0.58, (255, 255, 255), 1)
 
             sent = " ".join(committed_words[-8:])
             put_text(display, f"Committed: {sent}", (20, display.shape[0] - 35), 0.75, (255, 255, 0), 2)
@@ -681,11 +911,16 @@ def main():
             if key in (ord('r'), ord('R')):
                 seq_buffer.clear()
                 pred_history.clear()
+                topk_history.clear()
+                ema_probs = None
                 hand_state = {"last_lh": None, "last_rh": None, "lh_hold": 0, "rh_hold": 0}
                 last_status = "buffer reset"
             if key in (ord('c'), ord('C')):
                 committed_words.clear()
                 last_commit_label = None
+                pred_history.clear()
+                topk_history.clear()
+                ema_probs = None
                 last_status = "committed words cleared"
 
     cap.release()

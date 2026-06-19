@@ -2,16 +2,27 @@ python .\realtime_ksl_keypoint_infer.py `
   --model_path ".\models\ksl_keypoint_tcn_final.pt" `
   --label_map_path ".\models\label_map.json" `
   --camera 0 `
-  --window_frames 96 `
-  --multi_windows 48,72,96 `
-  --min_window_frames 32 `
+  --width 960 `
+  --height 540 `
+  --window_frames 120 `
+  --multi_windows 72,96,120 `
+  --min_window_frames 60 `
   --predict_every 3 `
   --topk 5 `
-  --conf_threshold 0.70 `
-  --majority_ratio 0.65 `
-  --smooth_history 8 `
-  --min_commit_history 5 `
-  --cooldown_sec 1.0 `
-  --repeat_cooldown_sec 2.0 `
-  --max_missing_ratio 0.55 `
-  --hold_missing_hands 6
+  --prob_ema_alpha 0.55 `
+  --stable_history 16 `
+  --stable_topk 5 `
+  --rank_decay 0.65 `
+  --stable_min_score 0.055 `
+  --stable_min_count_ratio 0.55 `
+  --stable_margin 0.025 `
+  --commit_min_last_prob 0.120 `
+  --commit_require_current_top1 `
+  --commit_min_current_top1_prob 0.120 `
+  --min_commit_history 8 `
+  --cooldown_sec 1.8 `
+  --repeat_cooldown_sec 3.5 `
+  --max_missing_ratio 0.60 `
+  --hold_missing_hands 8 `
+  --min_motion_energy 0.0010 `
+  --reset_hand_state_after_commit
